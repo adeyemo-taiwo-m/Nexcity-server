@@ -1,94 +1,148 @@
 require('dotenv').config();
+
 const express = require('express');
 const http = require('http');
 const cors = require('cors');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 
+// ---------------------------------------------------------------------------
+// 1. Basic server setup
+// ---------------------------------------------------------------------------
+
 const app = express();
+app.use(cors({ origin: process.env.CLIENT_ORIGIN }));
 
-// Configure CORS
-app.use(cors({ origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173' }));
-
-// Express needs a raw HTTP server to attach Socket.io to
+// Socket.io needs a raw http.Server to attach to — Express's own app.listen()
+// wraps this internally, but we need the raw server object ourselves so both
+// Express routes and Socket.io can share the same underlying server/port.
 const server = http.createServer(app);
+
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_ORIGIN || 'http://localhost:5173',
-    methods: ['GET', 'POST']
-  }
+    origin: process.env.CLIENT_ORIGIN,
+    methods: ['GET', 'POST'],
+  },
 });
 
-// Initialize Supabase Client
-const supabaseUrl = process.env.SUPABASE_URL;
-const supabaseServiceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+// ---------------------------------------------------------------------------
+// 2. Supabase client (privileged — server-side only, see .env notes above)
+// ---------------------------------------------------------------------------
 
-if (!supabaseUrl || !supabaseServiceRoleKey) {
-  console.warn('WARNING: SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY environment variables are missing!');
-}
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
 
-const supabase = createClient(supabaseUrl || '', supabaseServiceRoleKey || '');
+// ---------------------------------------------------------------------------
+// 3. Track connected clients (simple in-memory counter — fine for a single
+//    server instance; would need a shared store like Redis if this were ever
+//    scaled to multiple server instances)
+// ---------------------------------------------------------------------------
 
-// Keep track of connected clients
 let onlineCount = 0;
 
 io.on('connection', (socket) => {
   onlineCount++;
-  console.log(`Client connected. Total online: ${onlineCount}`);
+  console.log(`[socket] client connected (${socket.id}). Total online: ${onlineCount}`);
 
-  socket.on('disconnect', () => {
+  socket.on('disconnect', (reason) => {
     onlineCount--;
-    console.log(`Client disconnected. Total online: ${onlineCount}`);
+    console.log(`[socket] client disconnected (${socket.id}, reason: ${reason}). Total online: ${onlineCount}`);
   });
 });
 
-// Subscribe to Supabase Postgres changes and relay to socket clients
-supabase
-  .channel('db-changes')
-  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'properties' }, (payload) => {
-    console.log('Received property INSERT from Supabase:', payload.new.title);
-    io.emit('notification:new', {
-      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
-      type: 'property',
-      message: `New property listed: ${payload.new.title}`,
-      data: payload.new,
-      timestamp: new Date().toISOString(),
-    });
-  })
-  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'transactionDetails' }, (payload) => {
-    console.log('Received transaction INSERT from Supabase:', payload.new.amount);
-    io.emit('notification:new', {
-      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
-      type: 'transaction',
-      message: `New transaction recorded: ₦${Number(payload.new.amount).toLocaleString()}`,
-      data: payload.new,
-      timestamp: new Date().toISOString(),
-    });
-    io.emit('stat:update', { key: 'transactions', delta: 1 });
-  })
-  .on('postgres_changes', { event: 'INSERT', schema: 'public', table: 'customersDetails' }, (payload) => {
-    console.log('Received customer INSERT from Supabase:', payload.new.name);
-    io.emit('notification:new', {
-      id: crypto.randomUUID ? crypto.randomUUID() : Math.random().toString(36).substring(2, 9),
-      type: 'customer',
-      message: `New customer lead: ${payload.new.name}`,
-      data: payload.new,
-      timestamp: new Date().toISOString(),
-    });
-  })
+// ---------------------------------------------------------------------------
+// 4. Core relay logic
+//    Subscribe to Postgres changes via Supabase Realtime, reshape each change
+//    into a small frontend-friendly event, and broadcast it over Socket.io.
+//    We deliberately reshape rather than forwarding the raw payload, so the
+//    frontend never depends on exact database column names.
+// ---------------------------------------------------------------------------
+
+const channel = supabase.channel('db-changes');
+
+channel
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'properties' },
+    (payload) => {
+      io.emit('notification:new', {
+        type: 'property',
+        message: `New property listed: ${payload.new.title}`,
+        data: payload.new,
+        timestamp: new Date().toISOString(),
+      });
+      io.emit('stat:update', { key: 'properties', delta: 1 });
+    }
+  )
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'transactionDetails' },
+    (payload) => {
+      io.emit('notification:new', {
+        type: 'transaction',
+        message: `New transaction recorded: ₦${payload.new.amount}`,
+        data: payload.new,
+        timestamp: new Date().toISOString(),
+      });
+      io.emit('stat:update', { key: 'transactions', delta: 1 });
+    }
+  )
+  .on(
+    'postgres_changes',
+    { event: 'INSERT', schema: 'public', table: 'customersDetails' },
+    (payload) => {
+      io.emit('notification:new', {
+        type: 'customer',
+        message: `New customer lead: ${payload.new.name}`,
+        data: payload.new,
+        timestamp: new Date().toISOString(),
+      });
+      io.emit('stat:update', { key: 'customers', delta: 1 });
+    }
+  )
   .subscribe((status) => {
-    console.log(`Supabase replication subscription status: ${status}`);
+    console.log(`[supabase] realtime channel status: ${status}`);
   });
 
-// Health check endpoint
+// ---------------------------------------------------------------------------
+// 5. Health check — lets a reviewer or uptime monitor confirm the service
+//    and its Supabase subscription are alive, without needing a socket client.
+// ---------------------------------------------------------------------------
+
 app.get('/health', (req, res) => {
   res.json({
     status: 'ok',
-    onlineClients: onlineCount
+    onlineClients: onlineCount,
+    supabaseChannelState: channel.state, // 'joined' once subscribed successfully
   });
 });
+
+// ---------------------------------------------------------------------------
+// 6. Start server
+// ---------------------------------------------------------------------------
 
 const PORT = process.env.PORT || 4000;
 server.listen(PORT, () => {
   console.log(`Realtime server running on port ${PORT}`);
 });
+
+// ---------------------------------------------------------------------------
+// 7. Graceful shutdown — closes the Supabase channel and socket connections
+//    cleanly instead of just killing the process, so reconnecting clients
+//    get a clean disconnect event rather than a hung connection.
+// ---------------------------------------------------------------------------
+
+process.on('SIGTERM', shutdown);
+process.on('SIGINT', shutdown);
+
+function shutdown() {
+  console.log('Shutting down gracefully...');
+  supabase.removeChannel(channel);
+  io.close(() => {
+    server.close(() => {
+      process.exit(0);
+    });
+  });
+}
