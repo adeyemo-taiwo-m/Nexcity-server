@@ -80,6 +80,7 @@ channel
     'postgres_changes',
     { event: 'INSERT', schema: 'public', table: 'properties' },
     (payload) => {
+      console.log(`[supabase] INSERT event on "properties":`, JSON.stringify(payload.new));
       io.emit('notification:new', {
         type: 'property',
         message: `New property listed: ${payload.new.title}`,
@@ -93,6 +94,7 @@ channel
     'postgres_changes',
     { event: 'INSERT', schema: 'public', table: 'transactionDetails' },
     (payload) => {
+      console.log(`[supabase] INSERT event on "transactionDetails":`, JSON.stringify(payload.new));
       io.emit('notification:new', {
         type: 'transaction',
         message: `New transaction recorded: ₦${payload.new.amount}`,
@@ -106,6 +108,7 @@ channel
     'postgres_changes',
     { event: 'INSERT', schema: 'public', table: 'customersDetails' },
     (payload) => {
+      console.log(`[supabase] INSERT event on "customersDetails":`, JSON.stringify(payload.new));
       io.emit('notification:new', {
         type: 'customer',
         message: `New customer lead: ${payload.new.name}`,
