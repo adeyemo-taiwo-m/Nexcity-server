@@ -10,8 +10,20 @@ const { createClient } = require('@supabase/supabase-js');
 // 1. Basic server setup
 // ---------------------------------------------------------------------------
 
+const allowedOrigins = process.env.CLIENT_ORIGIN
+  ? process.env.CLIENT_ORIGIN.split(',').map(o => o.trim())
+  : ['http://localhost:5173'];
+
 const app = express();
-app.use(cors({ origin: process.env.CLIENT_ORIGIN }));
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  }
+}));
 
 // Socket.io needs a raw http.Server to attach to — Express's own app.listen()
 // wraps this internally, but we need the raw server object ourselves so both
@@ -20,10 +32,11 @@ const server = http.createServer(app);
 
 const io = new Server(server, {
   cors: {
-    origin: process.env.CLIENT_ORIGIN,
+    origin: allowedOrigins,
     methods: ['GET', 'POST'],
   },
 });
+
 
 // ---------------------------------------------------------------------------
 // 2. Supabase client (privileged — server-side only, see .env notes above)
